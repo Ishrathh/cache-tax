@@ -333,28 +333,91 @@ async function showStatus($: EngineInterface, s: State) {
 
 type BandInput = RenderInput<'AbovePrompt'>
 
+/** Colors the card shares with the cube row: Claude's terracotta on both themes, read against the theme's text. */
+function palette(light: boolean) {
+  return light
+    ? { accent: '#c15f3c', warm: '#1a7f37', text: '#1f1f1f', dim: '#6e6e6e', track: 'rgba(0,0,0,0.08)' }
+    : { accent: '#d97757', warm: '#3fb950', text: '#ececec', dim: '#9a9a9a', track: 'rgba(255,255,255,0.10)' }
+}
+
+const CARD_FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif"
+
+function esc(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/** The two costs as bars that grow in: the cold write at full width, the warm turn in proportion, never thinner than a hairline. */
+export function costSvg(h: Held, width: number, light: boolean): string {
+  const c = palette(light)
+  const labelW = 110
+  const amountW = 64
+  const barX = labelW
+  const barW = Math.max(60, width - labelW - amountW)
+  const cold = h.coldUsd ?? 0
+  const warm = h.warmUsd ?? 0
+  const warmW = cold > 0 ? Math.max(3, Math.round(barW * warm / cold)) : 3
+  const row = (y: number, label: string, amount: string, w: number, fill: string, delay: string, note: string) => `
+<text x="0" y="${y + 13}" fill="${c.text}" font-family="${CARD_FONT}" font-size="12" font-weight="600">${esc(label)}</text>
+<rect x="${barX}" y="${y + 4}" width="${barW}" height="10" rx="5" fill="${c.track}"/>
+<rect x="${barX}" y="${y + 4}" width="${w}" height="10" rx="5" fill="${fill}">
+  <animate attributeName="width" from="0" to="${w}" dur="0.55s" begin="${delay}" fill="freeze" calcMode="spline" keySplines="0.2 0.8 0.2 1"/>
+</rect>
+<text x="${barX + barW + 10}" y="${y + 13}" fill="${c.text}" font-family="${CARD_FONT}" font-size="12" font-weight="700" font-variant-numeric="tabular-nums">${esc(amount)}</text>
+<text x="${barX}" y="${y + 28}" fill="${c.dim}" font-family="${CARD_FONT}" font-size="10.5">${esc(note)}</text>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="76" viewBox="0 0 ${width} 76">
+<style>@media (prefers-reduced-motion: reduce) { animate { display: none } }</style>
+${row(2, 'Send it now', fmtUsd(h.coldUsd), barW, c.accent, '0.05s', `re-writes up to ${fmtTok(h.tokens)} tokens at the cache-write rate`)}
+${row(40, 'A warm turn', fmtUsd(h.warmUsd), warmW, c.warm, '0.25s', 'the same turn once the cache is warm again')}
+</svg>`
+}
+
 /** The card above the prompt box while a cold send is held. */
-function holdCard($: EngineInterface, e: BandInput, h: Held, accent: string | undefined, act: { pay: () => void; fresh: () => void; status: () => void }) {
-  const { Box, Text, Button } = $.ui.resolve(e)
-  const column = (title: string, amount: string, note: string) => Box({ flexDirection: 'column', marginRight: 4, children: [
-    Text({ dimColor: true, children: [title] }),
-    Text({ bold: true, children: [amount] }),
-    Text({ dimColor: true, children: [note] }),
-  ] })
-  return Box({ flexDirection: 'column', borderStyle: 'round', borderColor: accent, paddingX: 1, children: [
-    Text({ color: accent, bold: true, children: ['CACHE TAX'] }),
-    Text({ bold: true, children: ['Your message is on hold'] }),
-    Text({ children: [`The prompt cache went cold ${fmtDuration(h.coldMs)} ago`] }),
-    Box({ flexDirection: 'row', marginTop: 1, children: [
-      column('Send it now', fmtUsd(h.coldUsd), `re-writes up to ${fmtTok(h.tokens)} tokens`),
-      column('A warm turn', fmtUsd(h.warmUsd), 'what it costs once the cache is warm'),
+function holdCard($: EngineInterface, e: BandInput, h: Held, light: boolean, noColor: boolean, act: { pay: () => void; fresh: () => void; status: () => void }) {
+  const ui = $.ui.resolve(e)
+  const { Box, Text, Button } = ui
+  const c = palette(light)
+  const accent = noColor ? undefined : c.accent
+  const costs = e.surface === 'desktop' && 'Svg' in ui
+    ? Box({ marginTop: 1, marginBottom: 1, children: [ui.Svg({
+        source: costSvg(h, Math.max(260, Math.min(640, (e.props.bodyColumns || 60) * 8 - 48)), light),
+        alt: `Send it now ${fmtUsd(h.coldUsd)}, re-writes up to ${fmtTok(h.tokens)} tokens. A warm turn ${fmtUsd(h.warmUsd)}.`,
+        width: Math.max(260, Math.min(640, (e.props.bodyColumns || 60) * 8 - 48)),
+        height: 76,
+        isInteractive: true,
+      })] })
+    : Box({ flexDirection: 'row', marginTop: 1, marginBottom: 1, children: [
+        Box({ flexDirection: 'column', marginRight: 4, children: [
+          Text({ dimColor: true, children: ['Send it now'] }),
+          Text({ bold: true, color: accent, children: [fmtUsd(h.coldUsd)] }),
+          Text({ dimColor: true, children: [`re-writes up to ${fmtTok(h.tokens)} tokens`] }),
+        ] }),
+        Box({ flexDirection: 'column', children: [
+          Text({ dimColor: true, children: ['A warm turn'] }),
+          Text({ bold: true, color: noColor ? undefined : 'success', children: [fmtUsd(h.warmUsd)] }),
+          Text({ dimColor: true, children: ['what it costs once the cache is warm'] }),
+        ] }),
+      ] })
+  const mark = noColor ? Text({ bold: true, children: ['[>]'] })
+    : e.surface === 'desktop' && 'Svg' in ui ? ui.Svg({ source: statusIcons[light ? 'light' : 'dark'].cold.svg, width: 16, height: 16, alt: 'Cache Tax' })
+    : e.surface === 'terminal' && 'Image' in ui ? ui.Image({ source: { png: statusIcons[light ? 'light' : 'dark'].cold.png }, columns: 3, rows: 1, alt: '[>]' })
+    : Text({ color: accent, bold: true, children: ['[>]'] })
+  return Box({ flexDirection: 'column', borderStyle: 'round', borderColor: accent, paddingX: 1, marginTop: 1, children: [
+    Box({ flexDirection: 'row', alignItems: 'center', gap: 1, children: [
+      Box({ flexShrink: 0, children: [mark] }),
+      Text({ color: accent, bold: true, children: ['CACHE TAX'] }),
+      Text({ dimColor: true, children: [`· cold for ${fmtDuration(h.coldMs)}`] }),
     ] }),
-    Text({ dimColor: true, italic: true, children: [`\u201c${quote(h.text)}\u201d`] }),
+    Text({ bold: true, children: ['Your message is on hold'] }),
+    Text({ dimColor: true, children: [`The prompt cache went cold ${fmtDuration(h.coldMs)} ago`] }),
+    costs,
+    Box({ borderStyle: 'single', borderDimColor: true, paddingX: 1, children: [
+      Text({ dimColor: true, italic: true, wrap: 'truncate-end', children: [`\u201c${quote(h.text)}\u201d`] }),
+    ] }),
     Text({ dimColor: true, children: [`Pay once and keepwarm then holds the cache for ${fmtDuration(AUTO_WARM_MS)}`] }),
-    Box({ flexDirection: 'row', gap: 1, marginTop: 1, children: [
-      Button({ key: 'pay', label: 'Pay and send', variant: 'primary', hotkey: '1', onPress: act.pay }),
-      Button({ key: 'fresh', label: 'Start fresh', hotkey: '2', onPress: act.fresh }),
-      Button({ key: 'status', label: 'Show cache status', hotkey: '3', onPress: act.status }),
+    Box({ flexDirection: 'row', gap: 1, marginTop: 1, marginBottom: 1, children: [
+      Button({ key: 'pay', label: 'Pay and send', variant: 'primary', hotkey: '1', autoFocus: true, onPress: act.pay }),
+      Button({ key: 'fresh', label: 'Start fresh', variant: 'secondary', hotkey: '2', onPress: act.fresh }),
+      Button({ key: 'status', label: 'Show cache status', dimColor: true, hotkey: '3', onPress: act.status }),
     ] }),
   ] })
 }
@@ -386,11 +449,10 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const h = await read($, held)
     if (h) {
-      const accent = noColor ? undefined : light ? '#c15f3c' : '#d97757'
       const { Box } = $.ui.resolve(e)
       rest = Box({ flexDirection: 'column', children: [
         rest,
-        holdCard($, e, h, accent, { pay: () => { void paySend($, s) }, fresh: () => { void startFresh($) }, status: () => { void showStatus($, s) } }),
+        holdCard($, e, h, light, noColor, { pay: () => { void paySend($, s) }, fresh: () => { void startFresh($) }, status: () => { void showStatus($, s) } }),
       ] })
     }
     const text = statusText(s, now)

@@ -1,7 +1,14 @@
 {
   "name": "cache-tax-card",
-  "owner": { "name": "local" },
+  "owner": {
+    "name": "local"
+  },
   "plugins": [
-    { "name": "cache-tax", "source": "./", "description": "cache-tax with the cold-cache refusal drawn as a card above the prompt box (local build)" }
-  ]
+    {
+      "name": "cache-tax",
+      "source": "./",
+      "description": "cache-tax with the cold-cache refusal drawn as a card above the prompt box (local build)"
+    }
+  ],
+  "description": "Local build of cache-tax: the cold-cache refusal as a card above the prompt box."
 }

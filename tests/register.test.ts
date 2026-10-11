@@ -2,7 +2,7 @@ import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
-import { fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
+import { costSvg, fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
 
 tier('user')
 
@@ -469,10 +469,18 @@ describe('hold card', () => {
       expect((await ui.find({ type: 'Text', text: 'CACHE TAX' }))?.props.bold).toBe(true)
       expect((await ui.find({ type: 'Text', text: 'Your message is on hold' }))?.props.bold).toBe(true)
       expect((await ui.find({ type: 'Text', text: /went cold/ }))?.text).toBe('The prompt cache went cold 2h00m ago')
-      expect((await ui.find({ type: 'Text', text: 'Send it now' }))?.text).toBe('Send it now')
-      expect((await ui.find({ type: 'Text', text: /^\$4\.01$/ }))?.props.bold).toBe(true)
-      expect((await ui.find({ type: 'Text', text: 'A warm turn' }))?.text).toBe('A warm turn')
-      expect((await ui.find({ type: 'Text', text: /^\$0\.05$/ }))?.props.bold).toBe(true)
+      if (surface === 'desktop') {
+        const bars = (await ui.findAll({ type: 'Svg' })).find(el => String(el.props.alt).startsWith('Send it now'))
+        expect(bars?.props.alt).toBe('Send it now $4.01, re-writes up to 201k tokens. A warm turn $0.05.')
+        expect(bars?.props.isInteractive).toBe(true)
+        expect(String(bars?.props.source)).toMatch(/<animate attributeName="width"/)
+        expect(await ui.find({ type: 'Text', text: 'Send it now' })).toBe(undefined)
+      } else {
+        expect((await ui.find({ type: 'Text', text: 'Send it now' }))?.text).toBe('Send it now')
+        expect((await ui.find({ type: 'Text', text: /^\$4\.01$/ }))?.props.bold).toBe(true)
+        expect((await ui.find({ type: 'Text', text: 'A warm turn' }))?.text).toBe('A warm turn')
+        expect((await ui.find({ type: 'Text', text: /^\$0\.05$/ }))?.props.bold).toBe(true)
+      }
       expect((await ui.find({ type: 'Text', text: /hi there/ }))?.text).toBe('\u201chi there\u201d')
       expect((await ui.find({ type: 'Text', text: /Pay once/ }))?.text).toBe('Pay once and keepwarm then holds the cache for 3h00m')
       expect((await ui.findAll({ type: 'Button' })).map(b => b.props.label)).toEqual(['Pay and send', 'Start fresh', 'Show cache status'])
@@ -536,6 +544,15 @@ describe('hold card', () => {
       expect(await ui.find({ text: 'Your message is on hold' })).toBe(undefined)
     })
   }
+
+  test('the cost bars scale the warm turn against the cold write and never vanish', async () => {
+    const held = { text: 'x', coldMs: 0, tokens: 200502, coldUsd: 4.01, warmUsd: 0.05 }
+    const svg = costSvg(held, 400, false)
+    expect(svg).toMatch(/width="226" height="10" rx="5" fill="#d97757"/)
+    expect(svg).toMatch(/width="3" height="10" rx="5" fill="#3fb950"/)
+    expect(svg).toMatch(/prefers-reduced-motion/)
+    expect(costSvg({ ...held, coldUsd: null, warmUsd: null }, 400, true)).toMatch(/n\/a/)
+  })
 
   test('the hold ends with the session', async ($, on) => {
     const clock = mock.clock(on, { now: START })
