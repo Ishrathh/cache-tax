@@ -1,5 +1,9 @@
-import type { EngineInterface, Register } from 'claude-code'
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderInput } from 'claude-code'
+import type { Held } from '../types'
 import { statusIcons } from './status-icons'
+
+const held = atom({ plugin: 'cache-tax', key: 'held' } as const, null)
 
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
@@ -109,6 +113,27 @@ function guardText(s: State, now: number): string {
   return `the prompt cache went cold ${fmtDuration(now - s.lastRequestAt - TTL_MS)} ago. Sending this re-writes ` +
     `up to ${s.ctx.toLocaleString('en-US')} tokens at ${rate} = ${fmtUsd(coldUsd(s))}` +
     (warm == null ? '' : ` (a warm turn would have cost ${fmtUsd(warm)})`) + '.'
+}
+
+/** What the guard holds back on a surface that draws the card; the price it quotes is the cold write. */
+function holdOf(s: State, now: number, text: string): Held {
+  return { text, coldMs: now - s.lastRequestAt - TTL_MS, tokens: s.ctx, coldUsd: coldUsd(s), warmUsd: warmUsd(s) }
+}
+
+/** The short drop reason: the card above the prompt box carries the detail. */
+function holdText(h: Held): string {
+  return `cache-tax: your message is on hold until you choose on the card above the prompt box (cold cache, up to ${fmtUsd(h.coldUsd)})`
+}
+
+async function setHeld($: EngineInterface, value: Held | null) {
+  await update($, held, () => value)
+  $.ui.invalidate('ui.render')
+}
+
+/** One line of the held message, as the card quotes it. */
+function quote(text: string): string {
+  const one = text.replace(/\s+/g, ' ').trim()
+  return one.length > 160 ? one.slice(0, 157) + '...' : one
 }
 
 export type ResumeFields = {
@@ -286,6 +311,54 @@ function card(s: State, now: number): string {
   return lines.join('\n')
 }
 
+// Pay and send: the resend is the plugin's, so the guard lets it through; the turn then scores the cold write.
+async function paySend($: EngineInterface, s: State) {
+  const h = await read($, held)
+  if (!h) return
+  s.ackedAt = 0
+  s.coldWritePending = true
+  await setHeld($, null)
+  await $.prompt.submit({ text: h.text, asUser: true })
+}
+
+async function startFresh($: EngineInterface) {
+  await setHeld($, null)
+  await $.command.run({ command: 'clear' })
+}
+
+// A plugin's own command.run skips its own hooks, so the card is drawn directly, as /cache-tax draws it.
+async function showStatus($: EngineInterface, s: State) {
+  $.ui.log(card(s, await $.clock.now()))
+}
+
+type BandInput = RenderInput<'AbovePrompt'>
+
+/** The card above the prompt box while a cold send is held. */
+function holdCard($: EngineInterface, e: BandInput, h: Held, accent: string | undefined, act: { pay: () => void; fresh: () => void; status: () => void }) {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const column = (title: string, amount: string, note: string) => Box({ flexDirection: 'column', marginRight: 4, children: [
+    Text({ dimColor: true, children: [title] }),
+    Text({ bold: true, children: [amount] }),
+    Text({ dimColor: true, children: [note] }),
+  ] })
+  return Box({ flexDirection: 'column', borderStyle: 'round', borderColor: accent, paddingX: 1, children: [
+    Text({ color: accent, bold: true, children: ['CACHE TAX'] }),
+    Text({ bold: true, children: ['Your message is on hold'] }),
+    Text({ children: [`The prompt cache went cold ${fmtDuration(h.coldMs)} ago`] }),
+    Box({ flexDirection: 'row', marginTop: 1, children: [
+      column('Send it now', fmtUsd(h.coldUsd), `re-writes up to ${fmtTok(h.tokens)} tokens`),
+      column('A warm turn', fmtUsd(h.warmUsd), 'what it costs once the cache is warm'),
+    ] }),
+    Text({ dimColor: true, italic: true, children: [`\u201c${quote(h.text)}\u201d`] }),
+    Text({ dimColor: true, children: [`Pay once and keepwarm then holds the cache for ${fmtDuration(AUTO_WARM_MS)}`] }),
+    Box({ flexDirection: 'row', gap: 1, marginTop: 1, children: [
+      Button({ key: 'pay', label: 'Pay and send', variant: 'primary', hotkey: '1', onPress: act.pay }),
+      Button({ key: 'fresh', label: 'Start fresh', hotkey: '2', onPress: act.fresh }),
+      Button({ key: 'status', label: 'Show cache status', hotkey: '3', onPress: act.status }),
+    ] }),
+  ] })
+}
+
 export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
@@ -308,9 +381,18 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const rest = await next(e)
+    let rest = await next(e)
     if (!s.hasBand || e.props.hasSurvey) return rest
     const now = await $.clock.now()
+    const h = await read($, held)
+    if (h) {
+      const accent = noColor ? undefined : light ? '#c15f3c' : '#d97757'
+      const { Box } = $.ui.resolve(e)
+      rest = Box({ flexDirection: 'column', children: [
+        rest,
+        holdCard($, e, h, accent, { pay: () => { void paySend($, s) }, fresh: () => { void startFresh($) }, status: () => { void showStatus($, s) } }),
+      ] })
+    }
     const text = statusText(s, now)
     if (!text || (s.deadline && now >= s.deadline)) return rest
     const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
@@ -457,12 +539,29 @@ export const register: Register = on => {
       return next(e)
     }
     if (s.ackedAt === s.lastRequestAt) {
+      // A different message typed while one is held takes its place on the card; the same one again pays.
+      const h = s.hasBand ? await read($, held) : null
+      if (h && h.text !== e.text) {
+        const next_ = holdOf(s, now, e.text)
+        await setHeld($, next_)
+        return { drop: holdText(next_) }
+      }
       s.ackedAt = 0
       s.coldWritePending = true
+      await setHeld($, null)
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(AUTO_WARM_MS)}. Or /clear and start from a note.` }
+    // Without a band there is no card: the refusal line carries the price and the resend pays.
+    if (!s.hasBand) return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(AUTO_WARM_MS)}. Or /clear and start from a note.` }
+    const h = holdOf(s, now, e.text)
+    await setHeld($, h)
+    return { drop: holdText(h) }
+  })
+
+  on('session.end', async ($, e, next) => {
+    await setHeld($, null)
+    return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {

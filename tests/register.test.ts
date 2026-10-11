@@ -61,6 +61,13 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('command.list', () => ({ value: (opts.commands ?? []).map(name => ({ name, description: '', source: 'plugin' as const })) }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.submit', ($, e) => { entered.push(e.text); return { text: e.text } })
+  const ran: string[] = []
+  on('command.run', ($, e) => { ran.push(e.command); return { text: '' } })
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  // The hold as the mod last wrote it; undefined until a write, null once cleared.
+  const writes: unknown[] = []
+  on('state.set', { plugin: 'cache-tax', key: 'held' }, ($, e, next) => { writes.push(e.value); return next(e) })
+  const held = () => writes.at(-1)
   on('session.compact', ($, e) => ({ messages: e.messages }))
   on('classic.SessionStart', () => ({}))
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
@@ -75,7 +82,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     const value: ModelForkResult = { isAnswered: true, text: 'warm', usage: { input_tokens: a.input ?? 2, output_tokens: a.out ?? 1, cache_read_input_tokens: a.read, cache_creation_input_tokens: a.write } }
     return { value }
   })
-  return { forks, status, logs, entered, reads }
+  return { forks, status, logs, entered, ran, reads, held }
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
@@ -440,6 +447,117 @@ describe('guard', () => {
     const w = world(on, [], { commands: ['cache-tax:status'] })
     await $.session.start(session)
     expect(w.logs.at(-1)).toMatch(/hook form .* is also installed/)
+  })
+})
+
+describe('hold card', () => {
+  type Hold = { text: string } | null | undefined
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`${surface}: a cold send is held on a card, and Pay and send resends it as the person's words`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start({ ...session, surface, isInteractive: true })
+      await $.turn.complete(turn())
+      const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
+      expect(await ui.find({ text: 'Your message is on hold' })).toBe(undefined)
+      await clock.advance(3 * HOUR)
+      const first = await $.prompt.submit(prompt('hi there'))
+      expect(first.drop).toBe('cache-tax: your message is on hold until you choose on the card above the prompt box (cold cache, up to $4.01)')
+      expect(w.entered).toEqual([])
+      expect(w.held()).toEqual({ text: 'hi there', coldMs: 2 * HOUR, tokens: 200502, coldUsd: 200502 * 20 / 1e6, warmUsd: 200502 * 0.25 / 1e6 })
+      expect((await ui.find({ type: 'Text', text: 'CACHE TAX' }))?.props.bold).toBe(true)
+      expect((await ui.find({ type: 'Text', text: 'Your message is on hold' }))?.props.bold).toBe(true)
+      expect((await ui.find({ type: 'Text', text: /went cold/ }))?.text).toBe('The prompt cache went cold 2h00m ago')
+      expect((await ui.find({ type: 'Text', text: 'Send it now' }))?.text).toBe('Send it now')
+      expect((await ui.find({ type: 'Text', text: /^\$4\.01$/ }))?.props.bold).toBe(true)
+      expect((await ui.find({ type: 'Text', text: 'A warm turn' }))?.text).toBe('A warm turn')
+      expect((await ui.find({ type: 'Text', text: /^\$0\.05$/ }))?.props.bold).toBe(true)
+      expect((await ui.find({ type: 'Text', text: /hi there/ }))?.text).toBe('\u201chi there\u201d')
+      expect((await ui.find({ type: 'Text', text: /Pay once/ }))?.text).toBe('Pay once and keepwarm then holds the cache for 3h00m')
+      expect((await ui.findAll({ type: 'Button' })).map(b => b.props.label)).toEqual(['Pay and send', 'Start fresh', 'Show cache status'])
+      expect((await ui.find({ key: 'pay' }))?.props.variant).toBe('primary')
+      await ui.press({ key: 'pay' })
+      expect(w.entered).toEqual(['hi there'])
+      expect(w.held()).toBe(null)
+      expect(await ui.find({ text: 'Your message is on hold' })).toBe(undefined)
+      expect(w.ran).toEqual([])
+      // The paid turn is scored and arms keepwarm, as a resend did before the card.
+      await $.turn.complete(turn({ usage: usage({ cache_creation_input_tokens: 200000, cache_read_input_tokens: 0 }) }))
+      expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$4\.00/)
+      expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/keepwarm    on, 3h00m left/)
+      expect(w.forks.length).toBe(0)
+    })
+
+    test(`${surface}: Start fresh drops the hold and runs /clear`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start({ ...session, surface, isInteractive: true })
+      await $.turn.complete(turn())
+      const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/on hold/)
+      expect(await ui.find({ key: 'fresh' })).toBeDefined()
+      await ui.press({ key: 'fresh' })
+      expect(w.ran).toEqual(['clear'])
+      expect(w.entered).toEqual([])
+      expect(w.held()).toBe(null)
+      expect(await ui.find({ text: 'Your message is on hold' })).toBe(undefined)
+      // After /clear nothing is cold, so the next message goes straight through.
+      await $.classic.SessionStart({ source: 'clear' })
+      expect((await $.prompt.submit(prompt('after clear'))).drop).toBe(undefined)
+      expect(w.entered).toEqual(['after clear'])
+    })
+
+    test(`${surface}: a new message replaces the held one, the same one again pays, and Show cache status keeps the hold`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start({ ...session, surface, isInteractive: true })
+      await $.turn.complete(turn())
+      const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit(prompt('first thought'))).drop).toMatch(/on hold/)
+      expect((await ui.find({ type: 'Text', text: /first thought/ }))?.text).toBe('\u201cfirst thought\u201d')
+      await ui.press({ key: 'status' })
+      expect(w.ran).toEqual([])
+      expect(w.logs.at(-1)).toMatch(/state       COLD, last request 3h00m ago/)
+      expect((w.held() as Hold)?.text).toBe('first thought')
+      expect((await $.prompt.submit(prompt('second thought'))).drop).toMatch(/on hold/)
+      expect(w.entered).toEqual([])
+      expect(await ui.find({ type: 'Text', text: /first thought/ })).toBe(undefined)
+      expect((await ui.find({ type: 'Text', text: /second thought/ }))?.text).toBe('\u201csecond thought\u201d')
+      expect((w.held() as Hold)?.text).toBe('second thought')
+      // Slash commands pass while the hold stands.
+      expect((await $.prompt.submit(prompt('/cache-tax'))).drop).toBe(undefined)
+      expect((w.held() as Hold)?.text).toBe('second thought')
+      expect((await $.prompt.submit(prompt('second thought'))).drop).toBe(undefined)
+      expect(w.entered).toEqual(['/cache-tax', 'second thought'])
+      expect(w.held()).toBe(null)
+      expect(await ui.find({ text: 'Your message is on hold' })).toBe(undefined)
+    })
+  }
+
+  test('the hold ends with the session', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/on hold/)
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+    expect(w.held()).toBe(null)
+  })
+
+  test('headless keeps the refusal line and the resend', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/Send it again to pay it/)
+    expect(w.held()).toBe(undefined)
+    expect((await $.prompt.submit(prompt('other'))).drop).toBe(undefined)
+    expect(w.entered).toEqual(['other'])
   })
 })
 

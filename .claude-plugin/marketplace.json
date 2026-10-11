@@ -1,0 +1,7 @@
+{
+  "name": "cache-tax-card",
+  "owner": { "name": "local" },
+  "plugins": [
+    { "name": "cache-tax", "source": "./", "description": "cache-tax with the cold-cache refusal drawn as a card above the prompt box (local build)" }
+  ]
+}
